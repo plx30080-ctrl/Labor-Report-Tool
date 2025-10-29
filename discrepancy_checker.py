@@ -4,86 +4,83 @@ import streamlit as st
 st.title("Employee Hours Discrepancy Checker")
 
 # Upload files
-excel_file = st.file_uploader("Upload Excel File (.xls or .xlsx)", type=["xls", "xlsx"])
-csv_file = st.file_uploader("Upload CSV File", type=["csv"])
+prologistix_file = st.file_uploader("Upload ProLogistix Report (Excel)", type=["xls", "xlsx"])
+crescent_file = st.file_uploader("Upload Crescent Report (CSV or Excel)", type=["csv", "xlsx"])
 
-if excel_file and csv_file:
+if prologistix_file and crescent_file:
     try:
-        # Read Excel file with appropriate engine
-        if excel_file.name.endswith('.xls'):
-            excel_df_raw = pd.read_excel(excel_file, engine='xlrd', header=None)
+        # Read Crescent Report
+        if crescent_file.name.endswith(".csv"):
+            crescent_df = pd.read_csv(crescent_file)
         else:
-            excel_df_raw = pd.read_excel(excel_file, engine='openpyxl', header=None)
+            crescent_df = pd.read_excel(crescent_file, engine="openpyxl")
 
-        # Extract header rows
-        day_row = excel_df_raw.iloc[3]
-        label_row = excel_df_raw.iloc[4]
+        # Read ProLogistix Report and extract headers from rows 3 and 4
+        if prologistix_file.name.endswith(".xls"):
+            raw_excel = pd.read_excel(prologistix_file, header=None, engine="xlrd")
+        else:
+            raw_excel = pd.read_excel(prologistix_file, header=None, engine="openpyxl")
 
-        # Combine day and label to create meaningful column names
-        combined_headers = []
-        for day, label in zip(day_row, label_row):
-            if pd.isna(label):
-                combined_headers.append("")
-            elif pd.isna(day):
-                combined_headers.append(label.strip())
-            else:
-                combined_headers.append(f"{day.strip()} - {label.strip()}")
+        # Extract headers from rows 3 and 4
+        header_row_1 = raw_excel.iloc[3].fillna("")
+        header_row_2 = raw_excel.iloc[4].fillna("")
+        combined_headers = [f"{day.strip()} - {label.strip()}" if day and label else label.strip()
+                            for day, label in zip(header_row_1, header_row_2)]
+        data_df = raw_excel.iloc[6:].copy()
+        data_df.columns = combined_headers
 
-        excel_df_raw.columns = combined_headers
-        excel_df = excel_df_raw.iloc[6:].copy()
-        excel_df.reset_index(drop=True, inplace=True)
+        # Select day of week
+        st.subheader("Select Day of Week to Compare")
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        selected_day = st.selectbox("Day of Week", options=days)
 
-        # Read CSV file
-        csv_df = pd.read_csv(csv_file)
+        # Identify columns
+        eid_col = "File"
+        name_col = "Name"
+        hours_col = f"{selected_day} - Reg Hrs"
 
-        st.subheader("Select Columns to Compare")
+        # Extract EID and Name from ProLogistix
+        data_df["EID"] = data_df[eid_col].astype(str)
+        data_df["Name"] = data_df[name_col]
+        data_df["Excel Hours"] = pd.to_numeric(data_df[hours_col], errors="coerce").fillna(0)
 
-        # Select day of week for Excel hours
-        day_options = [col for col in combined_headers if "Reg Hrs" in col]
-        selected_day = st.selectbox("Select Day of Week (Excel)", options=day_options)
+        # Extract EID and Last3 from Crescent badge
+        crescent_df["EID"] = crescent_df["Badge"].str.extract(r'PLX-(\d+)-')[0]
+        crescent_df["Last3"] = crescent_df["Badge"].str.extract(r'-(\w{3})$')[0]
+        crescent_df["Payable hours"] = pd.to_numeric(crescent_df["Payable hours"], errors="coerce").fillna(0)
 
-        # Select EID column from Excel
-        excel_eid_col = st.selectbox("Excel EID Column", options=excel_df.columns)
+        # Group Crescent data
+        crescent_grouped = crescent_df.groupby("EID").agg({
+            "Payable hours": "sum",
+            "Last3": "first"
+        }).reset_index()
 
-        # Select Badge and Hours column from CSV
-        csv_badge_col = st.selectbox("CSV Badge Column", options=csv_df.columns)
-        csv_hours_col = st.selectbox("CSV Hours Column", options=csv_df.columns)
+        # Group ProLogistix data
+        prologistix_grouped = data_df.groupby("EID").agg({
+            "Excel Hours": "sum",
+            "Name": "first"
+        }).reset_index()
 
-        if st.button("Compare Files"):
-            # Extract EID and last name prefix from badge
-            csv_df["EID"] = csv_df[csv_badge_col].str.extract(r'[Pp][Ll][Xx]-(\d+)-')[0]
-            csv_df["Last3"] = csv_df[csv_badge_col].str.extract(r'-(\w{3})$')[0]
-            csv_df_grouped = csv_df.groupby("EID")[csv_hours_col].sum().reset_index()
-            csv_df_grouped["Last3"] = csv_df.groupby("EID")["Last3"].first().values
+        # Merge and compare
+        comparison_df = pd.merge(prologistix_grouped, crescent_grouped, on="EID", how="outer")
+        comparison_df.fillna({"Excel Hours": 0, "Payable hours": 0}, inplace=True)
+        comparison_df["Discrepancy"] = comparison_df["Excel Hours"] - comparison_df["Payable hours"]
 
-            # Prepare Excel data
-            excel_df["EID"] = excel_df[excel_eid_col].astype(str).str.extract(r'(\d+)')[0]
-            excel_df_grouped = excel_df.groupby("EID")[selected_day].sum().reset_index()
+        # Identify matches and discrepancies
+        matched = comparison_df[(comparison_df["Discrepancy"] == 0) & (comparison_df["Excel Hours"] != 0)]
+        discrepancies = comparison_df[comparison_df["Discrepancy"] != 0]
 
-            # Rename columns for merge
-            excel_df_grouped.rename(columns={selected_day: "Excel Hours"}, inplace=True)
-            csv_df_grouped.rename(columns={csv_hours_col: "CSV Hours"}, inplace=True)
+        st.subheader("Discrepancy Report")
+        st.write(f"✅ {len(matched)} associates match both files with no discrepancies.")
+        st.dataframe(discrepancies)
 
-            # Merge and compare
-            comparison_df = pd.merge(excel_df_grouped, csv_df_grouped, on="EID", how="outer")
-            comparison_df.fillna(0, inplace=True)
-            comparison_df["Discrepancy"] = comparison_df["Excel Hours"] - comparison_df["CSV Hours"]
-
-            unmatched = comparison_df[(comparison_df["Excel Hours"] == 0) | (comparison_df["CSV Hours"] == 0)]
-            mismatched = comparison_df[(comparison_df["Discrepancy"] != 0) & (comparison_df["Excel Hours"] != 0) & (comparison_df["CSV Hours"] != 0)]
-
-            result_df = pd.concat([unmatched, mismatched]).drop_duplicates()
-
-            st.subheader("Discrepancy Report")
-            st.dataframe(result_df)
-
-            # Download
-            st.download_button(
-                label="Download Discrepancy Report",
-                data=result_df.to_csv(index=False).encode('utf-8'),
-                file_name="discrepancy_report.csv",
-                mime="text/csv"
-            )
+        # Download button
+        st.download_button(
+            label="Download Discrepancy Report",
+            data=discrepancies.to_csv(index=False).encode("utf-8"),
+            file_name="discrepancy_report.csv",
+            mime="text/csv"
+        )
 
     except Exception as e:
         st.error(f"Error processing files: {e}")
