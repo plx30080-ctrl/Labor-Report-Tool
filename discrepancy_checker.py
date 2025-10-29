@@ -1,86 +1,148 @@
 import pandas as pd
 import streamlit as st
+import re
+from io import BytesIO
 
-st.title("Employee Hours Discrepancy Checker")
+st.set_page_config(page_title="Labor Report Discrepancy Checker", layout="wide")
+st.title("📊 Labor Report Discrepancy Checker")
+
+st.markdown("""
+This app compares two labor reports:
+- **ProLogistix Report** (Excel: `.xls` or `.xlsx`)
+- **Crescent Report** (CSV or Excel)
+
+It identifies discrepancies in hours worked and allows you to resolve and validate them.
+""")
 
 # Upload files
-prologistix_file = st.file_uploader("Upload ProLogistix Report (Excel)", type=["xls", "xlsx"])
-crescent_file = st.file_uploader("Upload Crescent Report (CSV or Excel)", type=["csv", "xlsx"])
+plx_file = st.file_uploader("Upload ProLogistix Report (.xls or .xlsx)", type=["xls", "xlsx"])
+crescent_file = st.file_uploader("Upload Crescent Report (.csv or .xlsx)", type=["csv", "xlsx"])
 
-if prologistix_file and crescent_file:
+if plx_file and crescent_file:
     try:
-        # Read Crescent Report
+        # Load Crescent report
         if crescent_file.name.endswith(".csv"):
             crescent_df = pd.read_csv(crescent_file)
         else:
             crescent_df = pd.read_excel(crescent_file, engine="openpyxl")
 
-        # Read ProLogistix Report and extract headers from rows 3 and 4
-        if prologistix_file.name.endswith(".xls"):
-            raw_excel = pd.read_excel(prologistix_file, header=None, engine="xlrd")
+        # Load ProLogistix report
+        if plx_file.name.endswith(".xls"):
+            raw_plx_df = pd.read_excel(plx_file, engine="xlrd", header=None)
         else:
-            raw_excel = pd.read_excel(prologistix_file, header=None, engine="openpyxl")
+            raw_plx_df = pd.read_excel(plx_file, engine="openpyxl", header=None)
 
-        # Extract headers from rows 3 and 4
-        header_row_1 = raw_excel.iloc[3].fillna("")
-        header_row_2 = raw_excel.iloc[4].fillna("")
-        combined_headers = [f"{day.strip()} - {label.strip()}" if day and label else label.strip()
-                            for day, label in zip(header_row_1, header_row_2)]
-        data_df = raw_excel.iloc[6:].copy()
-        data_df.columns = combined_headers
+        # Detect header row in ProLogistix report
+        header_row_index = None
+        for i in range(len(raw_plx_df)):
+            if raw_plx_df.iloc[i].astype(str).str.contains("Reg Hrs", case=False).any():
+                header_row_index = i
+                break
 
-        # Select day of week
-        st.subheader("Select Day of Week to Compare")
-        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        selected_day = st.selectbox("Day of Week", options=days)
+        if header_row_index is None:
+            st.error("Could not detect header row in ProLogistix report.")
+        else:
+            plx_df = pd.read_excel(plx_file, engine="xlrd" if plx_file.name.endswith(".xls") else "openpyxl", header=header_row_index)
+            plx_df.columns = plx_df.columns.astype(str).str.strip()
 
-        # Identify columns
-        eid_col = "File"
-        name_col = "Name"
-        hours_col = f"{selected_day} - Reg Hrs"
+            st.subheader("🔧 Column Selection")
 
-        # Extract EID and Name from ProLogistix
-        data_df["EID"] = data_df[eid_col].astype(str)
-        data_df["Name"] = data_df[name_col]
-        data_df["Excel Hours"] = pd.to_numeric(data_df[hours_col], errors="coerce").fillna(0)
+            eid_col = st.selectbox("Select EID column from ProLogistix", options=plx_df.columns)
+            name_col = st.selectbox("Select Name column from ProLogistix", options=plx_df.columns)
+            reg_hrs_col = st.selectbox("Select Reg Hrs column from ProLogistix", options=plx_df.columns)
 
-        # Extract EID and Last3 from Crescent badge
-        crescent_df["EID"] = crescent_df["Badge"].str.extract(r'PLX-(\d+)-')[0]
-        crescent_df["Last3"] = crescent_df["Badge"].str.extract(r'-(\w{3})$')[0]
-        crescent_df["Payable hours"] = pd.to_numeric(crescent_df["Payable hours"], errors="coerce").fillna(0)
+            badge_col = st.selectbox("Select Badge column from Crescent", options=crescent_df.columns)
+            crescent_hours_col = st.selectbox("Select Payable Hours column from Crescent", options=crescent_df.columns)
 
-        # Group Crescent data
-        crescent_grouped = crescent_df.groupby("EID").agg({
-            "Payable hours": "sum",
-            "Last3": "first"
-        }).reset_index()
+            if st.button("Compare Reports"):
+                # Prepare ProLogistix data
+                plx_df["EID"] = plx_df[eid_col].astype(str).str.extract(r"(\d{7,9})")
+                plx_df["Name"] = plx_df[name_col].astype(str)
+                plx_df["PLX Hours"] = pd.to_numeric(plx_df[reg_hrs_col], errors="coerce").fillna(0)
+                plx_summary = plx_df.groupby("EID").agg({"PLX Hours": "sum", "Name": "first"}).reset_index()
 
-        # Group ProLogistix data
-        prologistix_grouped = data_df.groupby("EID").agg({
-            "Excel Hours": "sum",
-            "Name": "first"
-        }).reset_index()
+                # Prepare Crescent data
+                crescent_df["EID"] = crescent_df[badge_col].astype(str).str.extract(r"(\d{7,9})")
+                crescent_df["Last3"] = crescent_df[badge_col].astype(str).str.extract(r"-(\w{3})$")
+                crescent_df["Badge"] = crescent_df[badge_col]
+                crescent_df["Crescent Hours"] = pd.to_numeric(crescent_df[crescent_hours_col], errors="coerce").fillna(0)
+                crescent_summary = crescent_df.groupby("EID").agg({"Crescent Hours": "sum", "Last3": "first", "Badge": "first"}).reset_index()
 
-        # Merge and compare
-        comparison_df = pd.merge(prologistix_grouped, crescent_grouped, on="EID", how="outer")
-        comparison_df.fillna({"Excel Hours": 0, "Payable hours": 0}, inplace=True)
-        comparison_df["Discrepancy"] = comparison_df["Excel Hours"] - comparison_df["Payable hours"]
+                # Merge and compare
+                merged = pd.merge(plx_summary, crescent_summary, on="EID", how="outer")
+                merged["Discrepancy"] = merged["PLX Hours"] - merged["Crescent Hours"]
+                merged["Error Type"] = ""
+                merged["Correction"] = ""
+                merged["Error #"] = ""
 
-        # Identify matches and discrepancies
-        matched = comparison_df[(comparison_df["Discrepancy"] == 0) & (comparison_df["Excel Hours"] != 0)]
-        discrepancies = comparison_df[comparison_df["Discrepancy"] != 0]
+                # Categorize discrepancies
+                plx_only = merged[merged["Crescent Hours"].isna()]
+                crescent_only = merged[merged["PLX Hours"].isna()]
+                mismatched = merged[(merged["PLX Hours"].notna()) & (merged["Crescent Hours"].notna()) & (merged["Discrepancy"] != 0)]
+                invalid_eid = crescent_df[crescent_df["EID"].isna()]
 
-        st.subheader("Discrepancy Report")
-        st.write(f"✅ {len(matched)} associates match both files with no discrepancies.")
-        st.dataframe(discrepancies)
+                st.subheader("📌 Discrepancy Summary")
+                st.markdown(f"✅ {len(merged) - len(plx_only) - len(crescent_only) - len(mismatched)} associates match both files with no discrepancies.")
 
-        # Download button
-        st.download_button(
-            label="Download Discrepancy Report",
-            data=discrepancies.to_csv(index=False).encode("utf-8"),
-            file_name="discrepancy_report.csv",
-            mime="text/csv"
-        )
+                st.subheader("🔍 PLX Discrepancies (Missing in Crescent)")
+                st.dataframe(plx_only)
+
+                st.subheader("🔍 Crescent Discrepancies (Missing in PLX)")
+                st.dataframe(crescent_only)
+
+                st.subheader("🔍 Mismatched Hours")
+                st.dataframe(mismatched)
+
+                st.subheader("⚠️ Invalid EIDs in Crescent Report")
+                st.dataframe(invalid_eid)
+
+                st.subheader("🛠️ Resolve Discrepancies")
+                for i in merged.index:
+                    merged.at[i, "Error #"] = f"Error {i+1}"
+                    resolution = st.selectbox(f"{merged.at[i, 'Error #']} - {merged.at[i, 'Name']}", ["", "EID Match", "Crescent Error", "PLX Error"], key=f"res_{i}")
+                    merged.at[i, "Error Type"] = resolution
+                    if resolution in ["Crescent Error", "PLX Error"]:
+                        correction = st.number_input(f"Enter corrected hours for {merged.at[i, 'Error #']}", min_value=0.0, value=0.0, key=f"corr_{i}")
+                        merged.at[i, "Correction"] = correction
+
+                if st.button("✅ Validate Files"):
+                    corrected_plx = merged.copy()
+                    corrected_plx["Final PLX Hours"] = corrected_plx["PLX Hours"]
+                    corrected_plx["Final Crescent Hours"] = corrected_plx["Crescent Hours"]
+
+                    for i in corrected_plx.index:
+                        if corrected_plx.at[i, "Error Type"] == "Crescent Error":
+                            corrected_plx.at[i, "Final Crescent Hours"] = corrected_plx.at[i, "Correction"]
+                        elif corrected_plx.at[i, "Error Type"] == "PLX Error":
+                            corrected_plx.at[i, "Final PLX Hours"] = corrected_plx.at[i, "Correction"]
+
+                    total_plx = corrected_plx["Final PLX Hours"].sum()
+                    total_crescent = corrected_plx["Final Crescent Hours"].sum()
+
+                    st.subheader("📊 Validation Summary")
+                    st.markdown(f"**Total PLX Hours:** {total_plx:.2f}")
+                    st.markdown(f"**Total Crescent Hours:** {total_crescent:.2f}")
+
+                    if abs(total_plx - total_crescent) < 0.01:
+                        st.success("✅ Total hours match after corrections.")
+                    else:
+                        st.error("❌ Total hours do not match after corrections.")
+
+                    # Generate client-ready summary
+                    st.subheader("📄 Client Summary")
+                    summary_lines = []
+                    for i in corrected_plx.index:
+                        if corrected_plx.at[i, "Error Type"] in ["Crescent Error", "PLX Error"]:
+                            name = corrected_plx.at[i, "Name"]
+                            eid = corrected_plx.at[i, "EID"]
+                            badge = corrected_plx.at[i, "Badge"]
+                            correct = corrected_plx.at[i, "Correction"]
+                            incorrect = corrected_plx.at[i, "Crescent Hours"] if corrected_plx.at[i, "Error Type"] == "Crescent Error" else corrected_plx.at[i, "PLX Hours"]
+                            line = f"{name} - Worked Line X for {correct} (correct hours), not {incorrect}. [{badge}]"
+                            summary_lines.append(line)
+
+                    summary_text = "\n".join(summary_lines)
+                    st.text_area("Summary to Email", summary_text, height=300)
 
     except Exception as e:
         st.error(f"Error processing files: {e}")
