@@ -1,16 +1,28 @@
 import pandas as pd
 import streamlit as st
+import tempfile
+import os
 
 st.title("Employee Hours Discrepancy Checker")
 
 # Upload files
-excel_file = st.file_uploader("Upload Excel File (.xlsx only)", type=["xlsx"])
+excel_file = st.file_uploader("Upload Excel File (.xls or .xlsx)", type=["xls", "xlsx"])
 csv_file = st.file_uploader("Upload CSV File", type=["csv"])
 
 if excel_file and csv_file:
     try:
-        # Read Excel file using openpyxl engine
-        excel_df = pd.read_excel(excel_file, engine='openpyxl', skiprows=6)
+        # Handle Excel file conversion if it's .xls
+        excel_ext = os.path.splitext(excel_file.name)[1].lower()
+        if excel_ext == ".xls":
+            # Read .xls using xlrd engine
+            xls_df = pd.read_excel(excel_file, sheet_name=0, skiprows=6, engine="xlrd")
+            # Save to temporary .xlsx file
+            temp_xlsx = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+            xls_df.to_excel(temp_xlsx.name, index=False, engine="openpyxl")
+            excel_df = pd.read_excel(temp_xlsx.name, engine="openpyxl")
+        else:
+            excel_df = pd.read_excel(excel_file, sheet_name=0, skiprows=6, engine="openpyxl")
+
         csv_df = pd.read_csv(csv_file)
 
         st.subheader("Select Columns to Compare")
