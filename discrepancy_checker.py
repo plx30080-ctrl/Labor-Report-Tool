@@ -80,7 +80,7 @@ def build_comparison(
         raise ValueError("Crescent file must contain a 'Badge' column.")
     cres["Badge"] = cres["Badge"].astype(str)
     cres["EID"] = cres["Badge"].str.extract(r"(?i)plx-(\d+)-")[0]  # Case-insensitive match for 'PLX'
-    cres["Last3"] = cres["Badge"].str.extract(r"-(\w{3})$", flags=re.IGNORECASE)[0]
+    cres["Last3"] = cres["Badge"].str.extract(r"-(\w{3})$" [0]
 
 
     if "Payable hours" not in cres.columns:
