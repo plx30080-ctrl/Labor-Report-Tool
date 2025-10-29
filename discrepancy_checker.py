@@ -1,94 +1,86 @@
 import pandas as pd
 import streamlit as st
-import re
 
-st.set_page_config(page_title="Discrepancy Checker", layout="wide")
 st.title("Employee Hours Discrepancy Checker")
 
 # Upload files
-plx_file = st.file_uploader("Upload ProLogistix Report (.xls or .xlsx)", type=["xls", "xlsx"])
-crescent_file = st.file_uploader("Upload Crescent Report (.csv or .xlsx)", type=["csv", "xlsx"])
+prologistix_file = st.file_uploader("Upload ProLogistix Report (Excel)", type=["xls", "xlsx"])
+crescent_file = st.file_uploader("Upload Crescent Report (CSV or Excel)", type=["csv", "xlsx"])
 
-if plx_file and crescent_file:
+if prologistix_file and crescent_file:
     try:
-        # Read Crescent file
+        # Read Crescent Report
         if crescent_file.name.endswith(".csv"):
             crescent_df = pd.read_csv(crescent_file)
         else:
             crescent_df = pd.read_excel(crescent_file, engine="openpyxl")
 
-        # Extract EID and Last3 from Badge
-        crescent_df["Badge"] = crescent_df["Badge"].astype(str)
-        crescent_df["EID"] = crescent_df["Badge"].str.extract(r'PLX-(\d+)-')
-        crescent_df["Last3"] = crescent_df["Badge"].str.extract(r'-(\w{3})$')
-        crescent_df["Payable hours"] = pd.to_numeric(crescent_df["Payable hours"], errors="coerce")
-        crescent_hours = crescent_df.groupby("EID")["Payable hours"].sum().reset_index()
-
-        # Read ProLogistix file
-        if plx_file.name.endswith(".xls"):
-            raw_excel = pd.read_excel(plx_file, engine="xlrd", header=None)
+        # Read ProLogistix Report and extract headers from rows 3 and 4
+        if prologistix_file.name.endswith(".xls"):
+            raw_excel = pd.read_excel(prologistix_file, header=None, engine="xlrd")
         else:
-            raw_excel = pd.read_excel(plx_file, engine="openpyxl", header=None)
+            raw_excel = pd.read_excel(prologistix_file, header=None, engine="openpyxl")
 
-        # Detect header row and clean column names
-        header_row_index = 4
-        headers = raw_excel.iloc[header_row_index].fillna("").astype(str).str.strip()
-        data_df = raw_excel.iloc[header_row_index + 2:].copy()
-        data_df.columns = headers
-        data_df.columns = data_df.columns.str.strip()
+        # Extract headers from rows 3 and 4
+        header_row_1 = raw_excel.iloc[3].fillna("")
+        header_row_2 = raw_excel.iloc[4].fillna("")
+        combined_headers = [f"{day.strip()} - {label.strip()}" if day and label else label.strip()
+                            for day, label in zip(header_row_1, header_row_2)]
+        data_df = raw_excel.iloc[6:].copy()
+        data_df.columns = combined_headers
 
-        # Identify EID and Name columns
-        eid_column = next((col for col in data_df.columns if data_df[col].astype(str).str.match(r'^\d{7,9}$').sum() > 5), None)
-        name_column = next((col for col in data_df.columns if data_df[col].astype(str).str.contains(",").sum() > 5), None)
+        # Select day of week
+        st.subheader("Select Day of Week to Compare")
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        selected_day = st.selectbox("Day of Week", options=days)
 
-        # Day-of-week selection
-        day_options = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        selected_day = st.selectbox("Select Day of Week", options=day_options)
+        # Identify columns
+        eid_col = "File"
+        name_col = "Name"
+        hours_col = f"{selected_day} - Reg Hrs"
 
-        # Find Reg Hrs column for selected day
-        reg_hrs_column = next((col for col in data_df.columns if selected_day in col and "Reg Hrs" in col), None)
+        # Extract EID and Name from ProLogistix
+        data_df["EID"] = data_df[eid_col].astype(str)
+        data_df["Name"] = data_df[name_col]
+        data_df["Excel Hours"] = pd.to_numeric(data_df[hours_col], errors="coerce").fillna(0)
 
-        if eid_column and name_column and reg_hrs_column:
-            data_df["EID"] = data_df[eid_column].astype(str).str.extract(r'(\d{7,9})')
-            data_df["Name"] = data_df[name_column].astype(str).str.strip()
-            data_df["Reg Hrs"] = pd.to_numeric(data_df[reg_hrs_column], errors="coerce")
-            plx_hours = data_df.groupby(["EID", "Name"])["Reg Hrs"].sum().reset_index()
+        # Extract EID and Last3 from Crescent badge
+        crescent_df["EID"] = crescent_df["Badge"].str.extract(r'PLX-(\d+)-')[0]
+        crescent_df["Last3"] = crescent_df["Badge"].str.extract(r'-(\w{3})$')[0]
+        crescent_df["Payable hours"] = pd.to_numeric(crescent_df["Payable hours"], errors="coerce").fillna(0)
 
-            # Merge and compare
-            merged_df = pd.merge(plx_hours, crescent_hours, on="EID", how="outer", suffixes=("_PLX", "_Crescent"))
-            merged_df["Reg Hrs"] = merged_df["Reg Hrs"].fillna(0)
-            merged_df["Payable hours"] = merged_df["Payable hours"].fillna(0)
-            merged_df["Discrepancy"] = merged_df["Reg Hrs"] - merged_df["Payable hours"]
+        # Group Crescent data
+        crescent_grouped = crescent_df.groupby("EID").agg({
+            "Payable hours": "sum",
+            "Last3": "first"
+        }).reset_index()
 
-            # Add Last3 from Crescent
-            crescent_last3 = crescent_df[["EID", "Last3"]].drop_duplicates()
-            merged_df = pd.merge(merged_df, crescent_last3, on="EID", how="left")
+        # Group ProLogistix data
+        prologistix_grouped = data_df.groupby("EID").agg({
+            "Excel Hours": "sum",
+            "Name": "first"
+        }).reset_index()
 
-            # Categorize discrepancies
-            plx_only = merged_df[(merged_df["Reg Hrs"] > 0) & (merged_df["Payable hours"] == 0)]
-            crescent_only = merged_df[(merged_df["Reg Hrs"] == 0) & (merged_df["Payable hours"] > 0)]
-            mismatched = merged_df[(merged_df["Reg Hrs"] > 0) & (merged_df["Payable hours"] > 0) & (merged_df["Discrepancy"] != 0)]
-            invalid_eid = crescent_df[crescent_df["EID"].isna()]
+        # Merge and compare
+        comparison_df = pd.merge(prologistix_grouped, crescent_grouped, on="EID", how="outer")
+        comparison_df.fillna({"Excel Hours": 0, "Payable hours": 0}, inplace=True)
+        comparison_df["Discrepancy"] = comparison_df["Excel Hours"] - comparison_df["Payable hours"]
 
-            # Display results
-            st.subheader("PLX Discrepancies (Missing in Crescent)")
-            st.dataframe(plx_only)
+        # Identify matches and discrepancies
+        matched = comparison_df[(comparison_df["Discrepancy"] == 0) & (comparison_df["Excel Hours"] != 0)]
+        discrepancies = comparison_df[comparison_df["Discrepancy"] != 0]
 
-            st.subheader("Crescent Discrepancies (Missing in PLX)")
-            st.dataframe(crescent_only)
+        st.subheader("Discrepancy Report")
+        st.write(f"✅ {len(matched)} associates match both files with no discrepancies.")
+        st.dataframe(discrepancies)
 
-            st.subheader("Mismatched Hours")
-            st.dataframe(mismatched)
-
-            st.subheader("Invalid EIDs in Crescent Report")
-            st.dataframe(invalid_eid)
-
-            # Summary
-            matched_count = merged_df[(merged_df["Discrepancy"] == 0) & (merged_df["Reg Hrs"] > 0)].shape[0]
-            st.success(f"✅ {matched_count} associates match both files with no discrepancies.")
-
-        else:
-            st.error("Could not detect EID, Name, or Reg Hrs column. Please check the file format.")
+        # Download button
+        st.download_button(
+            label="Download Discrepancy Report",
+            data=discrepancies.to_csv(index=False).encode("utf-8"),
+            file_name="discrepancy_report.csv",
+            mime="text/csv"
+        )
 
     except Exception as e:
         st.error(f"Error processing files: {e}")
