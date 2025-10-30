@@ -46,25 +46,20 @@ def to_number(x):
 
 
 def normalize_eid(eid):
-    """Return EID as zero-padded string of digits (no sign), or '' if invalid/empty."""
+    """Return EID as digits-only string, or '' if invalid/empty."""
     if eid is None or (isinstance(eid, float) and np.isnan(eid)):
         return ""
     s = str(eid).strip()
-    # remove non-digits
     digits = re.sub(r"[^0-9]", "", s)
     return digits
 
 
 def extract_eid_from_badge(badge: str) -> Tuple[str, bool]:
-    """
-    Extract EID from badge pattern 'PLX-########-ABC'.
-    Returns (eid_digits, valid_flag).
-    """
+    """Extract EID from badge pattern 'PLX-########-ABC'. Returns (eid_digits, valid_flag)."""
     if not isinstance(badge, str):
         return ("", False)
     m = re.match(r"(?i)^PLX-([0-9]{1,})-([A-Za-z]{3})$", badge.strip())
     if not m:
-        # Try to at least pull the digits in the middle if present
         digits = re.findall(r"([0-9]{3,})", badge.strip())
         if digits:
             return (digits[0], False)
@@ -72,54 +67,94 @@ def extract_eid_from_badge(badge: str) -> Tuple[str, bool]:
     return (m.group(1), True)
 
 
-def detect_plx_day_columns(columns: List[str]) -> Dict[str, Dict[str, List[str]]]:
+def find_day_columns(columns: List[str]) -> Dict[str, List[str]]:
     """
-    Build a map of per-day columns for REG and OT separately.
-    Returns: {DayName: {"reg": [cols], "ot": [cols]}}
-    Heuristics:
-      - Column belongs to a day if alias/full day appears
-      - Column is OT if it contains 'ot' or 'overtime' (word boundary-insensitive)
+    Given a list of column names, identify which map to each day.
+    Returns dict day_name -> list of matching columns (case-insensitive, includes aliases).
     """
-    day_map = {d: {"reg": [], "ot": []} for d in DAY_NAMES}
+    mapping = {d: [] for d in DAY_NAMES}
     for col in columns:
         low = str(col).strip().lower()
-        # identify day
-        day_found = None
+        found = False
         for alias, day in DAY_ALIASES.items():
             if re.search(rf"\b{alias}\b", low):
-                day_found = day
+                mapping[day].append(col)
+                found = True
                 break
-        if not day_found:
-            for d in DAY_NAMES:
-                if d.lower() in low:
-                    day_found = d
+        if not found:
+            for day in DAY_NAMES:
+                if day.lower() in low:
+                    mapping[day].append(col)
                     break
-        if not day_found:
-            continue
-        is_ot = bool(re.search(r"(?i)\bOT\b|\bovertime\b", col))
-        if is_ot:
-            day_map[day_found]["ot"].append(col)
-        else:
-            # treat as REG if not explicitly OT
-            day_map[day_found]["reg"].append(col)
-    # drop empty days
-    day_map = {d: m for d, m in day_map.items() if m["reg"] or m["ot"]}
-    return day_map
+    mapping = {k: v for k, v in mapping.items() if v}
+    return mapping
 
 
 # ---------------------------------
 # Loaders / Normalizers for Uploads
 # ---------------------------------
 
+def choose_name_column(cols):
+    """
+    Prefer a true associate name column, not 'Department Name' etc.
+    Priority:
+      - exact 'Name' (case-insensitive)
+      - ends with ' Name' but not containing 'department'
+      - contains 'associate' and 'name'
+      - any column containing 'name' but NOT 'department'
+    """
+    # exact
+    for c in cols:
+        if str(c).strip().lower() == "name":
+            return c
+    # endswith ' name' without 'department'
+    for c in cols:
+        cl = str(c).strip().lower()
+        if cl.endswith(" name") and "department" not in cl:
+            return c
+    # associate name patterns
+    for c in cols:
+        cl = str(c).strip().lower()
+        if "associate" in cl and "name" in cl:
+            return c
+    # generic but avoid department name
+    for c in cols:
+        cl = str(c).strip().lower()
+        if "name" in cl and "department" not in cl:
+            return c
+    return None
+
+
+def choose_eid_column(cols):
+    """
+    Prefer EID-like columns:
+      - exact 'File' (common in PLX)
+      - contains 'eid' or 'employee id'
+      - variations like 'File #' or 'ID'
+    """
+    for c in cols:
+        if str(c).strip().lower() == "file":
+            return c
+    for c in cols:
+        cl = str(c).strip().lower()
+        if "eid" in cl or re.search(r"\bemployee\s*id\b", cl):
+            return c
+    for c in cols:
+        if re.match(r"(?i)file\s*#?$", str(c)) or re.match(r"(?i)^id$", str(c)):
+            return c
+    return None
+
+
 def load_plx(file) -> pd.DataFrame:
     """
     Load ProLogistix excel (xls/xlsx). Assumptions:
       - Row 4 contains the column headers (1-indexed), so header=3 (0-indexed)
-      - EID column is often labeled "File" or similar, and a Name column exists
-      - Reg & OT hours can be split by weekday across multiple columns
-    Output normalized columns include per-day splits:
-      ['EID','Name','Reg_Hours','OT_Hours','Total_Hours',
-       'DayReg_Sun'..'DayReg_Sat','DayOT_Sun'..'DayOT_Sat']
+      - Contains an EID column often labeled 'File'
+      - Contains Name column (avoid 'Department Name')
+      - Contains Reg Hrs split by day of week somewhere
+      - OT Hrs columns might exist; we sum them if present
+    Output normalized columns:
+      ['EID','Name','Reg_Hours','OT_Hours','Total_Hours'] + optional ['Day_Sunday'..'Day_Saturday']
     """
     try:
         df = pd.read_excel(file, header=3, dtype=str)
@@ -130,20 +165,9 @@ def load_plx(file) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     df = df.replace({np.nan: None})
 
-    # Identify EID and Name
-    eid_col = None
-    name_col = None
-    for c in df.columns:
-        cl = c.lower()
-        if eid_col is None and ("file" in cl or "eid" in cl or re.search(r"\bemployee\s*id\b", cl)):
-            eid_col = c
-        if name_col is None and ("name" in cl):
-            name_col = c
-    if eid_col is None:
-        for c in df.columns:
-            if re.match(r"(?i)file\s*#?$", c) or re.match(r"(?i)id$", c):
-                eid_col = c
-                break
+    # Identify columns
+    eid_col = choose_eid_column(df.columns)
+    name_col = choose_name_column(df.columns)
 
     if eid_col is None:
         df["EID"] = ""
@@ -152,48 +176,35 @@ def load_plx(file) -> pd.DataFrame:
         df["Name"] = ""
         name_col = "Name"
 
-    # Detect day columns, distinguishing REG vs OT
-    day_map = detect_plx_day_columns(df.columns)
+    # Detect day columns (REG-ish) and OT candidates
+    day_map = find_day_columns(df.columns)
+    day_cols = sorted({col for cols in day_map.values() for col in cols})
 
-    # Also detect any non-day OT total columns so we don't miss them
-    ot_total_candidates = [c for c in df.columns if (re.search(r"(?i)\bOT\b|\bovertime\b", c) and c not in sum([v["ot"] for v in day_map.values()], []))]
+    ot_candidates = [c for c in df.columns if re.search(r"(?i)\bOT\b|\bovertime\b", c)]
 
-    # Build numeric frame
+    # Numeric conversion
     numeric_df = df.copy()
-    for c in df.columns:
-        numeric_df[c] = numeric_df[c].apply(to_number) if c not in [eid_col, name_col] else df[c]
+    for c in day_cols + ot_candidates:
+        numeric_df[c] = numeric_df[c].apply(to_number)
 
-    # Per-day aggregates
-    reg_by_day = {}
-    ot_by_day = {}
-    for i, day in enumerate(DAY_NAMES):
-        key = day_map.get(day, {"reg": [], "ot": []})
-        reg_cols = key["reg"]
-        ot_cols = key["ot"]
-        reg_by_day[day] = numeric_df[reg_cols].sum(axis=1) if reg_cols else 0.0
-        ot_by_day[day] = numeric_df[ot_cols].sum(axis=1) if ot_cols else 0.0
-
-    # Totals
-    reg_total = sum((reg_by_day[d] for d in DAY_NAMES), start=0) if reg_by_day else 0.0
-    ot_total = sum((ot_by_day[d] for d in DAY_NAMES), start=0) if ot_by_day else 0.0
-    if ot_total_candidates:
-        ot_total = ot_total + numeric_df[ot_total_candidates].sum(axis=1)
+    # Sum reg across detected day columns
+    reg_hours = numeric_df[day_cols].sum(axis=1) if day_cols else 0.0
+    # Sum OT hours across OT candidates
+    ot_hours = numeric_df[ot_candidates].sum(axis=1) if ot_candidates else 0.0
 
     norm = pd.DataFrame({
         "EID": df[eid_col].apply(normalize_eid),
         "Name": df[name_col].fillna("").astype(str).str.strip(),
-        "Reg_Hours": reg_total,
-        "OT_Hours": ot_total,
+        "Reg_Hours": reg_hours,
+        "OT_Hours": ot_hours,
     })
     norm["Total_Hours"] = norm["Reg_Hours"].fillna(0) + norm["OT_Hours"].fillna(0)
 
-    # Attach per-day columns (both REG and OT)
-    day_abbrev = {"Sunday":"Sun","Monday":"Mon","Tuesday":"Tue","Wednesday":"Wed","Thursday":"Thu","Friday":"Fri","Saturday":"Sat"}
-    for day in DAY_NAMES:
-        norm[f"DayReg_{day_abbrev[day]}"] = reg_by_day.get(day, 0.0)
-        norm[f"DayOT_{day_abbrev[day]}"] = ot_by_day.get(day, 0.0)
+    # Keep per-day REG columns for filtering (Day_ prefix)
+    for d, cols in day_map.items():
+        norm[f"Day_{d}"] = numeric_df[cols].sum(axis=1)
 
-    # Drop empties
+    # Drop empty EIDs and fully empty rows
     norm = norm[~((norm["EID"] == "") & (norm["Total_Hours"] == 0))].reset_index(drop=True)
     return norm
 
@@ -380,17 +391,22 @@ with st.sidebar:
     st.header("1) Upload Reports")
     plx_file = st.file_uploader("ProLogistix Report (.xls/.xlsx)", type=["xls","xlsx"], key="plx_up")
     cres_file = st.file_uploader("Crescent Report (.csv/.xlsx)", type=["csv","xlsx"], key="cres_up")
+
+    st.markdown("---")
+    st.header("Filter")
+    # Day filter: applies to discrepancy comparison & totals only
+    day_choice = st.selectbox("Filter by Day of Week (PLX)", options=["All Days"] + DAY_NAMES, index=0,
+                              help="Applies to comparisons & totals only. Raw tables remain unchanged.")
+
     st.markdown("---")
     st.header("Help")
-    st.markdown("• **PLX**: Row 4 should contain headers (e.g., days of week). The EID column is often labeled **File**.")
+    st.markdown("• **PLX**: Row 4 should contain headers (days of week). The EID column is often labeled **File**.")
     st.markdown("• **Crescent**: Includes **Badge**, **Payable Hours**, **Line**. Badges look like `PLX-00000000-ABC`.")
 
-if "plx_df" not in st.session_state:
-    st.session_state["plx_df"] = pd.DataFrame()
-if "cres_df" not in st.session_state:
-    st.session_state["cres_df"] = pd.DataFrame()
-if "disc_df" not in st.session_state:
-    st.session_state["disc_df"] = pd.DataFrame()
+# Session state
+for key in ["plx_df","cres_df","disc_df"]:
+    if key not in st.session_state:
+        st.session_state[key] = pd.DataFrame()
 
 # Load & normalize
 if plx_file:
@@ -403,7 +419,7 @@ plx_df = st.session_state["plx_df"]
 cres_df = st.session_state["cres_df"]
 
 # ---------------
-# 2) Process View
+# 2) Unified Views
 # ---------------
 st.header("2) Unified Data Views")
 
@@ -423,23 +439,9 @@ with c1:
                 "Reg_Hours": st.column_config.NumberColumn(format="%.2f"),
                 "OT_Hours": st.column_config.NumberColumn(format="%.2f"),
                 "Total_Hours": st.column_config.NumberColumn(format="%.2f", help="Reg + OT", disabled=True),
-                # show per-day splits for clarity & manual adjustments
-                "DayReg_Sun": st.column_config.NumberColumn(format="%.2f"),
-                "DayReg_Mon": st.column_config.NumberColumn(format="%.2f"),
-                "DayReg_Tue": st.column_config.NumberColumn(format="%.2f"),
-                "DayReg_Wed": st.column_config.NumberColumn(format="%.2f"),
-                "DayReg_Thu": st.column_config.NumberColumn(format="%.2f"),
-                "DayReg_Fri": st.column_config.NumberColumn(format="%.2f"),
-                "DayReg_Sat": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Sun": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Mon": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Tue": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Wed": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Thu": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Fri": st.column_config.NumberColumn(format="%.2f"),
-                "DayOT_Sat": st.column_config.NumberColumn(format="%.2f"),
             },
         )
+        st.caption("Note: Day filter affects comparisons/totals below, not this raw view.")
     else:
         st.info("Upload a PLX report to view.")
 
@@ -464,29 +466,18 @@ with c2:
     else:
         st.info("Upload a Crescent report to view.")
 
-# Recompute totals on edits (with guards to avoid KeyError)
+# Recompute totals on edits with guards
 if not plx_df.empty:
     edited_plx = st.session_state.get("plx_editor")
     if edited_plx is None:
         edited_plx = plx_df.copy()
     else:
-        # Ensure required columns exist
         for required in ["EID","Name","Reg_Hours","OT_Hours","Total_Hours"]:
             if required not in edited_plx.columns:
                 edited_plx[required] = "" if required in ["EID","Name"] else 0.0
-
     edited_plx["EID"] = edited_plx["EID"].apply(normalize_eid)
-    # recompute Reg/OT from per-day splits if present
-    reg_cols = [c for c in edited_plx.columns if c.startswith("DayReg_")]
-    ot_cols  = [c for c in edited_plx.columns if c.startswith("DayOT_")]
-    if reg_cols:
-        edited_plx["Reg_Hours"] = edited_plx[reg_cols].applymap(to_number).sum(axis=1)
-    else:
-        edited_plx["Reg_Hours"] = edited_plx["Reg_Hours"].apply(to_number)
-    if ot_cols:
-        edited_plx["OT_Hours"] = edited_plx[ot_cols].applymap(to_number).sum(axis=1)
-    else:
-        edited_plx["OT_Hours"] = edited_plx["OT_Hours"].apply(to_number)
+    edited_plx["Reg_Hours"] = edited_plx["Reg_Hours"].apply(to_number)
+    edited_plx["OT_Hours"] = edited_plx["OT_Hours"].apply(to_number)
     edited_plx["Total_Hours"] = edited_plx["Reg_Hours"].fillna(0) + edited_plx["OT_Hours"].fillna(0)
     st.session_state["plx_df"] = edited_plx
 
@@ -498,13 +489,28 @@ if not cres_df.empty:
     edited_cres["Payable_Hours"] = edited_cres["Payable_Hours"].apply(to_number)
     st.session_state["cres_df"] = edited_cres
 
+# Build PLX comparison view depending on day filter
+def build_plx_for_comparison(plx: pd.DataFrame, selected_day: str) -> pd.DataFrame:
+    comp = plx.copy()
+    if selected_day and selected_day != "All Days":
+        day_col = f"Day_{selected_day}"
+        if day_col in comp.columns:
+            comp["Reg_Hours"] = comp[day_col].apply(to_number)
+            comp["OT_Hours"] = 0.0
+            comp["Total_Hours"] = comp["Reg_Hours"]
+        else:
+            st.warning(f"Selected day '{selected_day}' not found in PLX columns. Using full totals instead.")
+    return comp
+
 # --------------------------
 # 3) Discrepancies & Resolutions
 # --------------------------
 st.header("3) Discrepancies & Resolutions")
 
 if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empty:
-    disc_df = detect_discrepancies(st.session_state["plx_df"], st.session_state["cres_df"])
+    plx_for_compare = build_plx_for_comparison(st.session_state["plx_df"], day_choice)
+    disc_df = detect_discrepancies(plx_for_compare, st.session_state["cres_df"])
+
     if not st.session_state["disc_df"].empty:
         prev = st.session_state["disc_df"][["EID","Badge","Category","Status","DayOfWeek","Notes"]].copy()
         disc_df = disc_df.merge(prev, on=["EID","Badge","Category"], how="left", suffixes=("","_prev"))
@@ -558,10 +564,12 @@ def totals(plx: pd.DataFrame, cres: pd.DataFrame) -> Tuple[float, float]:
     return float(plx["Total_Hours"].sum()), float(cres["Payable_Hours"].sum())
 
 if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empty:
-    t_plx, t_cres = totals(st.session_state["plx_df"], st.session_state["cres_df"])
+    # totals should honor the day filter
+    plx_for_compare = build_plx_for_comparison(st.session_state["plx_df"], day_choice)
+    t_plx, t_cres = totals(plx_for_compare, st.session_state["cres_df"])
     cA, cB = st.columns(2)
     with cA:
-        st.metric("PLX Total Hours", f"{t_plx:,.2f}")
+        st.metric(f"PLX Total Hours ({day_choice})", f"{t_plx:,.2f}")
     with cB:
         st.metric("Crescent Total Hours", f"{t_cres:,.2f}")
 
@@ -631,4 +639,4 @@ if not st.session_state["plx_df"].empty or not st.session_state["cres_df"].empty
 # Footer
 # --------------------------
 st.markdown("---")
-st.caption("Per-day REG/OT now visible as DayReg_* and DayOT_* for precise reconciliation. Edit freely; totals auto-recompute.")
+st.caption("Day filter applies to comparisons & totals. Raw PLX and Crescent views remain unchanged for transparency.")
