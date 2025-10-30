@@ -68,10 +68,6 @@ def extract_eid_from_badge(badge: str) -> Tuple[str, bool]:
 
 
 def find_day_columns(columns: List[str]) -> Dict[str, List[str]]:
-    """
-    Given a list of column names, identify which map to each day.
-    Returns dict day_name -> list of matching columns (case-insensitive, includes aliases).
-    """
     mapping = {d: [] for d in DAY_NAMES}
     for col in columns:
         low = str(col).strip().lower()
@@ -95,29 +91,17 @@ def find_day_columns(columns: List[str]) -> Dict[str, List[str]]:
 # ---------------------------------
 
 def choose_name_column(cols):
-    """
-    Prefer a true associate name column, not 'Department Name' etc.
-    Priority:
-      - exact 'Name' (case-insensitive)
-      - ends with ' Name' but not containing 'department'
-      - contains 'associate' and 'name'
-      - any column containing 'name' but NOT 'department'
-    """
-    # exact
     for c in cols:
         if str(c).strip().lower() == "name":
             return c
-    # endswith ' name' without 'department'
     for c in cols:
         cl = str(c).strip().lower()
         if cl.endswith(" name") and "department" not in cl:
             return c
-    # associate name patterns
     for c in cols:
         cl = str(c).strip().lower()
         if "associate" in cl and "name" in cl:
             return c
-    # generic but avoid department name
     for c in cols:
         cl = str(c).strip().lower()
         if "name" in cl and "department" not in cl:
@@ -126,12 +110,6 @@ def choose_name_column(cols):
 
 
 def choose_eid_column(cols):
-    """
-    Prefer EID-like columns:
-      - exact 'File' (common in PLX)
-      - contains 'eid' or 'employee id'
-      - variations like 'File #' or 'ID'
-    """
     for c in cols:
         if str(c).strip().lower() == "file":
             return c
@@ -146,16 +124,6 @@ def choose_eid_column(cols):
 
 
 def load_plx(file) -> pd.DataFrame:
-    """
-    Load ProLogistix excel (xls/xlsx). Assumptions:
-      - Row 4 contains the column headers (1-indexed), so header=3 (0-indexed)
-      - Contains an EID column often labeled 'File'
-      - Contains Name column (avoid 'Department Name')
-      - Contains Reg Hrs split by day of week somewhere
-      - OT Hrs columns might exist; we sum them if present
-    Output normalized columns:
-      ['EID','Name','Reg_Hours','OT_Hours','Total_Hours'] + optional ['Day_Sunday'..'Day_Saturday']
-    """
     try:
         df = pd.read_excel(file, header=3, dtype=str)
     except Exception:
@@ -165,7 +133,6 @@ def load_plx(file) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     df = df.replace({np.nan: None})
 
-    # Identify columns
     eid_col = choose_eid_column(df.columns)
     name_col = choose_name_column(df.columns)
 
@@ -176,20 +143,15 @@ def load_plx(file) -> pd.DataFrame:
         df["Name"] = ""
         name_col = "Name"
 
-    # Detect day columns (REG-ish) and OT candidates
     day_map = find_day_columns(df.columns)
     day_cols = sorted({col for cols in day_map.values() for col in cols})
-
     ot_candidates = [c for c in df.columns if re.search(r"(?i)\bOT\b|\bovertime\b", c)]
 
-    # Numeric conversion
     numeric_df = df.copy()
     for c in day_cols + ot_candidates:
         numeric_df[c] = numeric_df[c].apply(to_number)
 
-    # Sum reg across detected day columns
     reg_hours = numeric_df[day_cols].sum(axis=1) if day_cols else 0.0
-    # Sum OT hours across OT candidates
     ot_hours = numeric_df[ot_candidates].sum(axis=1) if ot_candidates else 0.0
 
     norm = pd.DataFrame({
@@ -200,23 +162,14 @@ def load_plx(file) -> pd.DataFrame:
     })
     norm["Total_Hours"] = norm["Reg_Hours"].fillna(0) + norm["OT_Hours"].fillna(0)
 
-    # Keep per-day REG columns for filtering (Day_ prefix)
     for d, cols in day_map.items():
         norm[f"Day_{d}"] = numeric_df[cols].sum(axis=1)
 
-    # Drop empty EIDs and fully empty rows
     norm = norm[~((norm["EID"] == "") & (norm["Total_Hours"] == 0))].reset_index(drop=True)
     return norm
 
 
 def load_crescent(file) -> pd.DataFrame:
-    """
-    Load Crescent csv/xlsx. Assumptions:
-      - Columns include 'Badge', 'Payable Hours', 'Line' (case-insensitive tolerant)
-      - Badge format is 'PLX-########-ABC' but we will try to parse even if malformed
-    Output normalized columns:
-      ['Badge','EID','EID_Valid','Last3','Line','Payable_Hours','Name']
-    """
     name = getattr(file, "name", "").lower()
     try:
         if name.endswith(".csv"):
@@ -230,7 +183,6 @@ def load_crescent(file) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     df = df.replace({np.nan: None})
 
-    # Identify columns
     badge_col = None
     hours_col = None
     line_col = None
@@ -394,8 +346,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Filter")
-    # Day filter: applies to discrepancy comparison & totals only
-    day_choice = st.selectbox("Filter by Day of Week (PLX)", options=["All Days"] + DAY_NAMES, index=0,
+    day_choice = st.selectbox("Filter by Day of Week (PLX)",
+                              options=["All Days"] + DAY_NAMES,
+                              index=0,
                               help="Applies to comparisons & totals only. Raw tables remain unchanged.")
 
     st.markdown("---")
@@ -403,7 +356,7 @@ with st.sidebar:
     st.markdown("• **PLX**: Row 4 should contain headers (days of week). The EID column is often labeled **File**.")
     st.markdown("• **Crescent**: Includes **Badge**, **Payable Hours**, **Line**. Badges look like `PLX-00000000-ABC`.")
 
-# Session state
+# Session state init
 for key in ["plx_df","cres_df","disc_df"]:
     if key not in st.session_state:
         st.session_state[key] = pd.DataFrame()
@@ -428,11 +381,11 @@ c1, c2 = st.columns(2, gap="large")
 with c1:
     st.subheader("ProLogistix (Normalized)")
     if not plx_df.empty:
-        st.data_editor(
+        plx_view = st.data_editor(
             plx_df,
             key="plx_editor",
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "EID": st.column_config.TextColumn(help="Employee ID (digits only)"),
                 "Name": st.column_config.TextColumn(),
@@ -443,16 +396,17 @@ with c1:
         )
         st.caption("Note: Day filter affects comparisons/totals below, not this raw view.")
     else:
+        plx_view = pd.DataFrame()
         st.info("Upload a PLX report to view.")
 
 with c2:
     st.subheader("Crescent (Normalized)")
     if not cres_df.empty:
-        st.data_editor(
+        cres_view = st.data_editor(
             cres_df,
             key="cres_editor",
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "Badge": st.column_config.TextColumn(),
                 "EID": st.column_config.TextColumn(help="Extracted from Badge; editable if needed"),
@@ -464,27 +418,23 @@ with c2:
             },
         )
     else:
+        cres_view = pd.DataFrame()
         st.info("Upload a Crescent report to view.")
 
-# Recompute totals on edits with guards
-if not plx_df.empty:
-    edited_plx = st.session_state.get("plx_editor")
-    if edited_plx is None:
-        edited_plx = plx_df.copy()
-    else:
-        for required in ["EID","Name","Reg_Hours","OT_Hours","Total_Hours"]:
-            if required not in edited_plx.columns:
-                edited_plx[required] = "" if required in ["EID","Name"] else 0.0
+# Recompute totals on edits using returned DataFrames
+if not plx_view.empty:
+    edited_plx = plx_view.copy()
+    for required in ["EID","Name","Reg_Hours","OT_Hours","Total_Hours"]:
+        if required not in edited_plx.columns:
+            edited_plx[required] = "" if required in ["EID","Name"] else 0.0
     edited_plx["EID"] = edited_plx["EID"].apply(normalize_eid)
     edited_plx["Reg_Hours"] = edited_plx["Reg_Hours"].apply(to_number)
     edited_plx["OT_Hours"] = edited_plx["OT_Hours"].apply(to_number)
     edited_plx["Total_Hours"] = edited_plx["Reg_Hours"].fillna(0) + edited_plx["OT_Hours"].fillna(0)
     st.session_state["plx_df"] = edited_plx
 
-if not cres_df.empty:
-    edited_cres = st.session_state.get("cres_editor")
-    if edited_cres is None:
-        edited_cres = cres_df.copy()
+if not cres_view.empty:
+    edited_cres = cres_view.copy()
     edited_cres["EID"] = edited_cres["EID"].apply(normalize_eid)
     edited_cres["Payable_Hours"] = edited_cres["Payable_Hours"].apply(to_number)
     st.session_state["cres_df"] = edited_cres
@@ -520,10 +470,10 @@ if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empt
         disc_df.drop(columns=drop_cols, inplace=True, errors="ignore")
 
     st.caption("Use the dropdowns and notes to classify each discrepancy.")
-    disc_editor = st.data_editor(
+    disc_view = st.data_editor(
         disc_df,
         key="disc_editor",
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         hide_index=True,
         column_config={
@@ -541,17 +491,17 @@ if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empt
             "Notes": st.column_config.TextColumn(),
         },
     )
-    st.session_state["disc_df"] = disc_editor
+    st.session_state["disc_df"] = disc_view
 
     c3, c4, c5, c6 = st.columns(4)
     with c3:
-        st.metric("PLX-only", int((disc_editor["Category"] == "PLX-only").sum()))
+        st.metric("PLX-only", int((disc_view["Category"] == "PLX-only").sum()))
     with c4:
-        st.metric("Crescent-only", int((disc_editor["Category"] == "Crescent-only").sum()))
+        st.metric("Crescent-only", int((disc_view["Category"] == "Crescent-only").sum()))
     with c5:
-        st.metric("Mismatched Hours", int((disc_editor["Category"] == "Mismatched Hours").sum()))
+        st.metric("Mismatched Hours", int((disc_view["Category"] == "Mismatched Hours").sum()))
     with c6:
-        st.metric("Invalid EID", int((disc_editor["Category"] == "Invalid EID").sum()))
+        st.metric("Invalid EID", int((disc_view["Category"] == "Invalid EID").sum()))
 else:
     st.info("Upload both files to generate discrepancies.")
 
@@ -564,7 +514,6 @@ def totals(plx: pd.DataFrame, cres: pd.DataFrame) -> Tuple[float, float]:
     return float(plx["Total_Hours"].sum()), float(cres["Payable_Hours"].sum())
 
 if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empty:
-    # totals should honor the day filter
     plx_for_compare = build_plx_for_comparison(st.session_state["plx_df"], day_choice)
     t_plx, t_cres = totals(plx_for_compare, st.session_state["cres_df"])
     cA, cB = st.columns(2)
@@ -606,7 +555,8 @@ if not st.session_state["disc_df"].empty:
         data=summary_text.encode("utf-8"),
         file_name="crescent_errors_summary.txt",
         mime="text/plain",
-        use_container_width=True,
+        help="Includes only items marked 'Crescent Error'.",
+        use_container_width=False,
     )
 else:
     st.info("Mark discrepancies as 'Crescent Error' above to generate the summary.")
@@ -632,11 +582,12 @@ if not st.session_state["plx_df"].empty or not st.session_state["cres_df"].empty
         data=data,
         file_name="plx_crescent_reconciliation.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        help="Exports normalized PLX/Crescent tabs plus Discrepancies.",
+        use_container_width=False,
     )
 
 # --------------------------
 # Footer
 # --------------------------
 st.markdown("---")
-st.caption("Day filter applies to comparisons & totals. Raw PLX and Crescent views remain unchanged for transparency.")
+st.caption("Data editors now use width='stretch'. Edits write back via return values to avoid session_state dicts.")
