@@ -72,27 +72,39 @@ def extract_eid_from_badge(badge: str) -> Tuple[str, bool]:
     return (m.group(1), True)
 
 
-def find_day_columns(columns: List[str]) -> Dict[str, List[str]]:
+def detect_plx_day_columns(columns: List[str]) -> Dict[str, Dict[str, List[str]]]:
     """
-    Given a list of column names, identify which map to each day.
-    Returns dict day_name -> list of matching columns (case-insensitive, includes aliases).
+    Build a map of per-day columns for REG and OT separately.
+    Returns: {DayName: {"reg": [cols], "ot": [cols]}}
+    Heuristics:
+      - Column belongs to a day if alias/full day appears
+      - Column is OT if it contains 'ot' or 'overtime' (word boundary-insensitive)
     """
-    mapping = {d: [] for d in DAY_NAMES}
+    day_map = {d: {"reg": [], "ot": []} for d in DAY_NAMES}
     for col in columns:
         low = str(col).strip().lower()
+        # identify day
+        day_found = None
         for alias, day in DAY_ALIASES.items():
             if re.search(rf"\b{alias}\b", low):
-                mapping[day].append(col)
+                day_found = day
                 break
-        else:
-            # also match full day names
-            for day in DAY_NAMES:
-                if day.lower() in low:
-                    mapping[day].append(col)
+        if not day_found:
+            for d in DAY_NAMES:
+                if d.lower() in low:
+                    day_found = d
                     break
-    # Only keep days that actually matched something
-    mapping = {k: v for k, v in mapping.items() if v}
-    return mapping
+        if not day_found:
+            continue
+        is_ot = bool(re.search(r"(?i)\bOT\b|\bovertime\b", col))
+        if is_ot:
+            day_map[day_found]["ot"].append(col)
+        else:
+            # treat as REG if not explicitly OT
+            day_map[day_found]["reg"].append(col)
+    # drop empty days
+    day_map = {d: m for d, m in day_map.items() if m["reg"] or m["ot"]}
+    return day_map
 
 
 # ---------------------------------
@@ -103,21 +115,18 @@ def load_plx(file) -> pd.DataFrame:
     """
     Load ProLogistix excel (xls/xlsx). Assumptions:
       - Row 4 contains the column headers (1-indexed), so header=3 (0-indexed)
-      - Contains an EID column often labeled "File" or similar, and a Name column
-      - Contains Reg Hrs split by day columns (Mon-Sun) somewhere
-      - Contains OT Hrs columns (can be per-day or total). We try to detect any 'OT' columns.
-    Output normalized columns:
-      ['EID','Name','Reg_Hours','OT_Hours','Total_Hours']
-      (Optionally: Day_* columns if we can detect per-day reg)
+      - EID column is often labeled "File" or similar, and a Name column exists
+      - Reg & OT hours can be split by weekday across multiple columns
+    Output normalized columns include per-day splits:
+      ['EID','Name','Reg_Hours','OT_Hours','Total_Hours',
+       'DayReg_Sun'..'DayReg_Sat','DayOT_Sun'..'DayOT_Sat']
     """
     try:
         df = pd.read_excel(file, header=3, dtype=str)
     except Exception:
-        # Fallback: try default header (row 0) if provided row fails
         file.seek(0)
         df = pd.read_excel(file, dtype=str)
 
-    # Trim col names and rows
     df.columns = [str(c).strip() for c in df.columns]
     df = df.replace({np.nan: None})
 
@@ -131,13 +140,11 @@ def load_plx(file) -> pd.DataFrame:
         if name_col is None and ("name" in cl):
             name_col = c
     if eid_col is None:
-        # Try a more aggressive guess
         for c in df.columns:
             if re.match(r"(?i)file\s*#?$", c) or re.match(r"(?i)id$", c):
                 eid_col = c
                 break
 
-    # If still not found, create placeholder
     if eid_col is None:
         df["EID"] = ""
         eid_col = "EID"
@@ -145,40 +152,49 @@ def load_plx(file) -> pd.DataFrame:
         df["Name"] = ""
         name_col = "Name"
 
-    # Detect day columns for REG
-    day_map = find_day_columns(df.columns)
-    day_cols = sorted({col for cols in day_map.values() for col in cols})
+    # Detect day columns, distinguishing REG vs OT
+    day_map = detect_plx_day_columns(df.columns)
 
-    # Detect OT columns – heuristics: any column containing 'ot' or 'overtime'
-    ot_candidates = [c for c in df.columns if re.search(r"(?i)\bOT\b|\bovertime\b", c)]
-    # Avoid double-counting: if an OT column is clearly per-day, we can still sum them
-    # Otherwise, if there's a single 'OT Hrs' total, we'll pick that too.
-    # Convert numeric
+    # Also detect any non-day OT total columns so we don't miss them
+    ot_total_candidates = [c for c in df.columns if (re.search(r"(?i)\bOT\b|\bovertime\b", c) and c not in sum([v["ot"] for v in day_map.values()], []))]
+
+    # Build numeric frame
     numeric_df = df.copy()
-    for c in day_cols + ot_candidates:
-        numeric_df[c] = numeric_df[c].apply(to_number)
+    for c in df.columns:
+        numeric_df[c] = numeric_df[c].apply(to_number) if c not in [eid_col, name_col] else df[c]
 
-    # Sum reg hours across detected day columns
-    reg_hours = numeric_df[day_cols].sum(axis=1) if day_cols else 0.0
+    # Per-day aggregates
+    reg_by_day = {}
+    ot_by_day = {}
+    for i, day in enumerate(DAY_NAMES):
+        key = day_map.get(day, {"reg": [], "ot": []})
+        reg_cols = key["reg"]
+        ot_cols = key["ot"]
+        reg_by_day[day] = numeric_df[reg_cols].sum(axis=1) if reg_cols else 0.0
+        ot_by_day[day] = numeric_df[ot_cols].sum(axis=1) if ot_cols else 0.0
 
-    # Sum OT hours across 'ot' candidates (works for per-day or single total)
-    ot_hours = numeric_df[ot_candidates].sum(axis=1) if ot_candidates else 0.0
+    # Totals
+    reg_total = sum((reg_by_day[d] for d in DAY_NAMES), start=0) if reg_by_day else 0.0
+    ot_total = sum((ot_by_day[d] for d in DAY_NAMES), start=0) if ot_by_day else 0.0
+    if ot_total_candidates:
+        ot_total = ot_total + numeric_df[ot_total_candidates].sum(axis=1)
 
     norm = pd.DataFrame({
         "EID": df[eid_col].apply(normalize_eid),
         "Name": df[name_col].fillna("").astype(str).str.strip(),
-        "Reg_Hours": reg_hours,
-        "OT_Hours": ot_hours,
+        "Reg_Hours": reg_total,
+        "OT_Hours": ot_total,
     })
     norm["Total_Hours"] = norm["Reg_Hours"].fillna(0) + norm["OT_Hours"].fillna(0)
 
-    # Keep day columns for optional per-day overrides
-    for d, cols in day_map.items():
-        norm[f"Day_{d}"] = numeric_df[cols].sum(axis=1)
+    # Attach per-day columns (both REG and OT)
+    day_abbrev = {"Sunday":"Sun","Monday":"Mon","Tuesday":"Tue","Wednesday":"Wed","Thursday":"Thu","Friday":"Fri","Saturday":"Sat"}
+    for day in DAY_NAMES:
+        norm[f"DayReg_{day_abbrev[day]}"] = reg_by_day.get(day, 0.0)
+        norm[f"DayOT_{day_abbrev[day]}"] = ot_by_day.get(day, 0.0)
 
-    # Drop empty EIDs and fully empty rows
-    norm = norm[~(norm["EID"] == "") | (norm["Total_Hours"] > 0)]
-    norm = norm.reset_index(drop=True)
+    # Drop empties
+    norm = norm[~((norm["EID"] == "") & (norm["Total_Hours"] == 0))].reset_index(drop=True)
     return norm
 
 
@@ -187,9 +203,8 @@ def load_crescent(file) -> pd.DataFrame:
     Load Crescent csv/xlsx. Assumptions:
       - Columns include 'Badge', 'Payable Hours', 'Line' (case-insensitive tolerant)
       - Badge format is 'PLX-########-ABC' but we will try to parse even if malformed
-      - There can be multiple rows per EID across different lines; we'll keep granular rows
     Output normalized columns:
-      ['Badge','EID','EID_Valid','Last3','Line','Payable_Hours']
+      ['Badge','EID','EID_Valid','Last3','Line','Payable_Hours','Name']
     """
     name = getattr(file, "name", "").lower()
     try:
@@ -221,9 +236,7 @@ def load_crescent(file) -> pd.DataFrame:
         if name_col is None and "name" in cl:
             name_col = c
 
-    # Fallbacks
     if badge_col is None:
-        # aggressively try
         for c in df.columns:
             if re.search(r"(?i)\bbadge\b", c):
                 badge_col = c
@@ -240,7 +253,6 @@ def load_crescent(file) -> pd.DataFrame:
         df["Name"] = ""
         name_col = "Name"
 
-    # Extract EID and validity
     badges = df[badge_col].fillna("")
     eid_extracted = []
     valid_flags = []
@@ -249,7 +261,6 @@ def load_crescent(file) -> pd.DataFrame:
         eid_d, valid = extract_eid_from_badge(b)
         eid_extracted.append(eid_d)
         valid_flags.append(valid)
-        # Extract last3 if present
         m = re.match(r"(?i)^PLX-[0-9]{1,}-([A-Za-z]{3})$", b.strip())
         last3s.append(m.group(1).upper() if m else "")
 
@@ -263,9 +274,7 @@ def load_crescent(file) -> pd.DataFrame:
         "Name": df[name_col].fillna("").astype(str).str.strip(),
     })
 
-    # Remove fully empty rows
-    out = out[~((out["Badge"] == "") & (out["Payable_Hours"] == 0))]
-    out = out.reset_index(drop=True)
+    out = out[~((out["Badge"] == "") & (out["Payable_Hours"] == 0))].reset_index(drop=True)
     return out
 
 
@@ -274,14 +283,11 @@ def load_crescent(file) -> pd.DataFrame:
 # ----------------------
 
 def summarize_plx(plx: pd.DataFrame) -> pd.DataFrame:
-    """ Return per-EID totals from PLX """
     g = plx.groupby(["EID", "Name"], dropna=False, as_index=False)[["Reg_Hours","OT_Hours","Total_Hours"]].sum()
     return g
 
 
 def summarize_crescent(cres: pd.DataFrame) -> pd.DataFrame:
-    """ Return per-EID totals from Crescent """
-    # Some rows may have empty/invalid EIDs; keep those for invalid category
     valid = cres[cres["EID"] != ""].copy()
     g = valid.groupby(["EID"], as_index=False)["Payable_Hours"].sum()
     return g
@@ -295,7 +301,6 @@ def detect_discrepancies(plx: pd.DataFrame, cres: pd.DataFrame) -> pd.DataFrame:
     merged["Total_Hours_PLX"] = merged["Total_Hours_PLX"].fillna(0.0)
     merged["Payable_Hours"] = merged["Payable_Hours"].fillna(0.0)
 
-    # attach one sample Line and Badge for messaging if available
     sample = cres.groupby("EID", as_index=False).agg({
         "Line": lambda s: next((x for x in s if x), ""),
         "Badge": lambda s: next((x for x in s if x), ""),
@@ -303,7 +308,6 @@ def detect_discrepancies(plx: pd.DataFrame, cres: pd.DataFrame) -> pd.DataFrame:
     })
     merged = merged.merge(sample, on="EID", how="left")
 
-    # Also keep PLX Name
     plx_name = plx_sum[["EID","Name"]].rename(columns={"Name":"Name_PLX"})
     merged = merged.merge(plx_name, on="EID", how="left")
 
@@ -320,17 +324,17 @@ def detect_discrepancies(plx: pd.DataFrame, cres: pd.DataFrame) -> pd.DataFrame:
             cat = "PLX-only"
         elif plx_total == 0 and cres_total > 0:
             cat = "Crescent-only"
-        elif plx_total != cres_total:
+        elif abs(plx_total - cres_total) > 1e-6:
             cat = "Mismatched Hours"
         else:
-            continue  # no discrepancy
+            continue
 
         rows.append({
             "EID": eid,
             "Name_PLX": r.get("Name_PLX", ""),
-            "Name_CRES": r.get("Name", ""),
-            "Badge": r.get("Badge", ""),
-            "Line": r.get("Line", ""),
+            "Name_CRES": r.get("Name", "") or "",
+            "Badge": r.get("Badge", "") or "",
+            "Line": r.get("Line", "") or "",
             "PLX_Hours": plx_total,
             "CRES_Hours": cres_total,
             "Diff": plx_total - cres_total,
@@ -340,7 +344,6 @@ def detect_discrepancies(plx: pd.DataFrame, cres: pd.DataFrame) -> pd.DataFrame:
             "Notes": "",
         })
 
-    # Invalid EIDs: any Crescent row with empty/malformed EID but non-zero hours
     invalid_rows = cres[(cres["EID"] == "") & (cres["Payable_Hours"] > 0)]
     for _, r in invalid_rows.iterrows():
         rows.append({
@@ -360,7 +363,6 @@ def detect_discrepancies(plx: pd.DataFrame, cres: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(rows)
     if not out.empty:
-        # add typed columns
         out["PLX_Hours"] = out["PLX_Hours"].astype(float)
         out["CRES_Hours"] = out["CRES_Hours"].astype(float)
         out["Diff"] = out["Diff"].astype(float)
@@ -421,6 +423,21 @@ with c1:
                 "Reg_Hours": st.column_config.NumberColumn(format="%.2f"),
                 "OT_Hours": st.column_config.NumberColumn(format="%.2f"),
                 "Total_Hours": st.column_config.NumberColumn(format="%.2f", help="Reg + OT", disabled=True),
+                # show per-day splits for clarity & manual adjustments
+                "DayReg_Sun": st.column_config.NumberColumn(format="%.2f"),
+                "DayReg_Mon": st.column_config.NumberColumn(format="%.2f"),
+                "DayReg_Tue": st.column_config.NumberColumn(format="%.2f"),
+                "DayReg_Wed": st.column_config.NumberColumn(format="%.2f"),
+                "DayReg_Thu": st.column_config.NumberColumn(format="%.2f"),
+                "DayReg_Fri": st.column_config.NumberColumn(format="%.2f"),
+                "DayReg_Sat": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Sun": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Mon": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Tue": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Wed": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Thu": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Fri": st.column_config.NumberColumn(format="%.2f"),
+                "DayOT_Sat": st.column_config.NumberColumn(format="%.2f"),
             },
         )
     else:
@@ -447,30 +464,47 @@ with c2:
     else:
         st.info("Upload a Crescent report to view.")
 
-# Recompute totals on edits
+# Recompute totals on edits (with guards to avoid KeyError)
 if not plx_df.empty:
-    edited_plx = st.session_state.get("plx_editor", plx_df).copy()
+    edited_plx = st.session_state.get("plx_editor")
+    if edited_plx is None:
+        edited_plx = plx_df.copy()
+    else:
+        # Ensure required columns exist
+        for required in ["EID","Name","Reg_Hours","OT_Hours","Total_Hours"]:
+            if required not in edited_plx.columns:
+                edited_plx[required] = "" if required in ["EID","Name"] else 0.0
+
     edited_plx["EID"] = edited_plx["EID"].apply(normalize_eid)
-    edited_plx["Reg_Hours"] = edited_plx["Reg_Hours"].apply(to_number)
-    edited_plx["OT_Hours"] = edited_plx["OT_Hours"].apply(to_number)
-    edited_plx["Total_Hours"] = edited_plx["Reg_Hours"] + edited_plx["OT_Hours"]
+    # recompute Reg/OT from per-day splits if present
+    reg_cols = [c for c in edited_plx.columns if c.startswith("DayReg_")]
+    ot_cols  = [c for c in edited_plx.columns if c.startswith("DayOT_")]
+    if reg_cols:
+        edited_plx["Reg_Hours"] = edited_plx[reg_cols].applymap(to_number).sum(axis=1)
+    else:
+        edited_plx["Reg_Hours"] = edited_plx["Reg_Hours"].apply(to_number)
+    if ot_cols:
+        edited_plx["OT_Hours"] = edited_plx[ot_cols].applymap(to_number).sum(axis=1)
+    else:
+        edited_plx["OT_Hours"] = edited_plx["OT_Hours"].apply(to_number)
+    edited_plx["Total_Hours"] = edited_plx["Reg_Hours"].fillna(0) + edited_plx["OT_Hours"].fillna(0)
     st.session_state["plx_df"] = edited_plx
 
 if not cres_df.empty:
-    edited_cres = st.session_state.get("cres_editor", cres_df).copy()
+    edited_cres = st.session_state.get("cres_editor")
+    if edited_cres is None:
+        edited_cres = cres_df.copy()
     edited_cres["EID"] = edited_cres["EID"].apply(normalize_eid)
     edited_cres["Payable_Hours"] = edited_cres["Payable_Hours"].apply(to_number)
     st.session_state["cres_df"] = edited_cres
 
 # --------------------------
-# 3) Detect & Edit Issues
+# 3) Discrepancies & Resolutions
 # --------------------------
 st.header("3) Discrepancies & Resolutions")
 
 if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empty:
-    # (Re)build discrepancy table
     disc_df = detect_discrepancies(st.session_state["plx_df"], st.session_state["cres_df"])
-    # merge previous statuses if any
     if not st.session_state["disc_df"].empty:
         prev = st.session_state["disc_df"][["EID","Badge","Category","Status","DayOfWeek","Notes"]].copy()
         disc_df = disc_df.merge(prev, on=["EID","Badge","Category"], how="left", suffixes=("","_prev"))
@@ -503,7 +537,6 @@ if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empt
     )
     st.session_state["disc_df"] = disc_editor
 
-    # Summary chips
     c3, c4, c5, c6 = st.columns(4)
     with c3:
         st.metric("PLX-only", int((disc_editor["Category"] == "PLX-only").sum()))
@@ -517,7 +550,7 @@ else:
     st.info("Upload both files to generate discrepancies.")
 
 # --------------------------
-# 4) Validation / Totals
+# 4) Totals Validation
 # --------------------------
 st.header("4) Totals Validation")
 
@@ -543,14 +576,6 @@ if not st.session_state["plx_df"].empty and not st.session_state["cres_df"].empt
 st.header("5) Generate Client Summary (Crescent Errors)")
 
 def build_client_summary(disc_df: pd.DataFrame) -> str:
-    """
-    Build summary lines for rows marked 'Crescent Error'.
-    Template: Associate Name - Worked Line X for # (correct hours), not # (incorrect hours). [Badge]
-    Logic:
-      - Prefer Name_PLX; fallback to Name_CRES
-      - Correct hours = PLX_Hours; Incorrect = CRES_Hours
-      - If no Line, omit 'Line X'
-    """
     parts = []
     df = disc_df.copy()
     df = df[df["Status"] == "Crescent Error"]
@@ -606,4 +631,4 @@ if not st.session_state["plx_df"].empty or not st.session_state["cres_df"].empty
 # Footer
 # --------------------------
 st.markdown("---")
-st.caption("Tip: You can edit hours directly in the tables above. Use the Status column to classify each discrepancy.")
+st.caption("Per-day REG/OT now visible as DayReg_* and DayOT_* for precise reconciliation. Edit freely; totals auto-recompute.")
